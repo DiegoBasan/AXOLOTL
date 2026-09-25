@@ -590,7 +590,7 @@ namespace Acura3._1.ModuleForms
                     SysPara.CurrentProcess = VisionForm.CurrentProcess = process;
                 }
                 else
-                    SysPara.CurrentProcess = VisionForm.CurrentProgram = 1;
+                    SysPara.CurrentProcess = VisionForm.CurrentProcess = 1;
             }));
         }
 

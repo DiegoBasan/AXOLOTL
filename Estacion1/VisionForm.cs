@@ -9,6 +9,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Windows.Forms;
@@ -25,6 +26,7 @@ namespace Acura3._1.ModuleForms
         public KeyenceController XGX;
         private ContrastechLight Light;
         private int retryCount, delayTrigger;
+        private bool initProgSent;
         public static int CurrentProcess, CurrentProgram;
         public (int Cavity, bool Alignment, bool ReInspect) currentCavity;
         public static bool Retry = false;
@@ -152,9 +154,19 @@ namespace Acura3._1.ModuleForms
                     .FirstOrDefault();
                 if (file != null)
                 {
+                    // Copia en memoria para no dejar el archivo bloqueado y liberar la imagen anterior
+                    Image newImage;
+                    using (var fs = new FileStream(file.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    using (var img = Image.FromStream(fs))
+                    {
+                        newImage = new Bitmap(img);
+                    }
+
                     // stretch the image to fit the picture box
                     picbox.SizeMode = PictureBoxSizeMode.StretchImage;
-                    picbox.Image = Image.FromFile(file.FullName);
+                    Image oldImage = picbox.Image;
+                    picbox.Image = newImage;
+                    oldImage?.Dispose();
                     picbox.Refresh();
                 }    
                     
@@ -189,7 +201,7 @@ namespace Acura3._1.ModuleForms
 
             if (picVision.IsHandleCreated)
             {
-                picVision.Invoke(new Action(() =>
+                picVision.BeginInvoke(new Action(() =>
                 {
                     SetImage(folder, picVision);
                 }));
@@ -241,6 +253,7 @@ namespace Acura3._1.ModuleForms
         public override void InitialReset()
         {
             retryCount = 3;
+            initProgSent = false;
             delayTrigger = GetSettingValue("PSet", "DelayTrigger");
             Retry = GetSettingValue("PSet", "Retry");
             RetryNum = GetSettingValue("PSet", "RetryNum");
@@ -361,21 +374,73 @@ namespace Acura3._1.ModuleForms
         #region Camera Manual
         private void XGX_OnCamDataReceived(object sender, KeyenceController.CamResult e)
         {
+            // Result / IsOK / ResultReady ya los llena KeyenceController; aqui solo se actualiza la UI
             if (e.CamId == 1)
             {
-                XGX.Result[1] = new string[e.ResultString.Length];
-                XGX.Result[1] = e.ResultString.Split(',');
-                XGX.IsOK[1] = e.Pass;
+                string[] lines = e.ResultString.Split(',');
+                bool pass = e.Pass;
 
                 if (txtCam?.IsHandleCreated == true)
                 {
-                    txtCam.Invoke(new Action(() =>
+                    // BeginInvoke: no bloquear el hilo de recepcion de la camara
+                    txtCam.BeginInvoke(new Action(() =>
                     {
-                        txtCam.Lines = XGX.Result[1];
-                        lblStatus.Text = XGX.IsOK[1] ? "Total status: OK" : "Total status: NG";
+                        txtCam.Lines = lines;
+                        lblStatus.Text = pass ? "Total status: OK" : "Total status: NG";
                     }));
                 }
             }
+        }
+
+        private void XGX_OnErrorCommand(object sender, string e)
+        {
+            MiddleLayer.LogF.AddLog(FunctionForms.LogForm.LogType.Production, $"Vision: camera error response {e}");
+        }
+
+        private void XGX_OnConnectionChanged(object sender, bool connected)
+        {
+            MiddleLayer.LogF.AddLog(FunctionForms.LogForm.LogType.Production,
+                connected ? "Vision: camera connected" : "Vision: camera disconnected");
+        }
+
+        private void CreateXGX()
+        {
+            if (XGX != null) return;
+
+            string sIP = GetSettingValue("PSet", "XGX_Ip");
+            int iPort = GetSettingValue("PSet", "XGX_Port");
+            int iTimeout = GetSettingValue("PSet", "XGX_Timeout");
+
+            XGX = new KeyenceController(sIP, iPort, iTimeout);
+            XGX.OnCamResultReceived += XGX_OnCamDataReceived;
+            XGX.OnCamTriggerAck += XGX_OnCamTriggerAck;
+            XGX.OnErrorCommand += XGX_OnErrorCommand;
+            XGX.OnConnectionChanged += XGX_OnConnectionChanged;
+        }
+
+        // Espera el resultado pendiente de un trigger previo (ej. el de Change Tool),
+        // limpia el resultado anterior y dispara. Regresa false mientras sigue esperando.
+        private bool TriggerCam(CTimer tm)
+        {
+            if (!tm.IsOn(delayTrigger))
+                return false;
+
+            if (XGX.WaitingResult[1] && !tm.IsOn(delayTrigger + 2000))
+                return false;
+
+            XGX.ClearResult(1);
+            XGX.Trigger(1);
+            return true;
+        }
+
+        // Lee X,Y de alineacion; false si el resultado no trae esos datos
+        private bool GetAlignment(out double X, out double Y)
+        {
+            X = Y = 0.0;
+            string[] r = XGX.Result[1];
+            return r != null && r.Length > 3
+                && double.TryParse(r[2], NumberStyles.Float, CultureInfo.InvariantCulture, out X)
+                && double.TryParse(r[3], NumberStyles.Float, CultureInfo.InvariantCulture, out Y);
         }
 
         private void XGX_OnCamTriggerAck(object sender, int e)
@@ -388,30 +453,24 @@ namespace Acura3._1.ModuleForms
 
         private void btnCamConnect_Click(object sender, EventArgs e)
         {
-            string sIP = GetSettingValue("PSet", "XGX_Ip");
-            int iPort = GetSettingValue("PSet", "XGX_Port");
-            int iTimeout = GetSettingValue("PSet", "XGX_Timeout");
-
-            if (XGX == null)
+            // El boton dice "Disconnect" cuando esta conectado
+            if (XGX != null && XGX.IsConnected)
             {
-                XGX = new KeyenceController(sIP, iPort, iTimeout);
-                XGX.OnCamResultReceived += XGX_OnCamDataReceived;
-                XGX.OnCamTriggerAck += XGX_OnCamTriggerAck;
+                XGX.Disconnect();
+                return;
             }
+
+            CreateXGX();
 
             if (XGX.Connect())
-            {
                 XGX.SetRunMode();
-            }
-
-            if (!XGX.Connect())
-            {
+            else
                 MessageBox.Show("Failed to Connect");
-            }
         }
 
         private void btnCamTrigger_Click(object sender, EventArgs e)
         {
+            XGX.ClearResult(1);
             XGX.Trigger(1);
             txtCam.Clear();
         }
@@ -453,16 +512,7 @@ namespace Acura3._1.ModuleForms
 
         private FCResultType fcInitCamConnect_FlowRun(object sender, EventArgs e)
         {
-            string sIP = GetSettingValue("PSet", "XGX_Ip");
-            int iPort = GetSettingValue("PSet", "XGX_Port");
-            int iTimeout = GetSettingValue("PSet", "XGX_Timeout");
-
-            if (XGX == null)
-            {
-                XGX = new KeyenceController(sIP, iPort, iTimeout);
-                XGX.OnCamResultReceived += XGX_OnCamDataReceived;
-                XGX.OnCamTriggerAck += XGX_OnCamTriggerAck;
-            }
+            CreateXGX();
 
             if (XGX.Connect())
             {
@@ -483,9 +533,21 @@ namespace Acura3._1.ModuleForms
 
         private FCResultType fcInitCamLoadProg_FlowRun(object sender, EventArgs e)
         {
-            CurrentProcess = VisionCavity.Keys.FirstOrDefault().Process;
-            CurrentProgram = VisionCavity.Keys.FirstOrDefault().Program;
-            XGX.ChangeProgram(1, CurrentProgram);
+            if (!initProgSent)
+            {
+                CurrentProcess = VisionCavity.Keys.FirstOrDefault().Process;
+                CurrentProgram = VisionCavity.Keys.FirstOrDefault().Program;
+                XGX.ChangeProgram(1, CurrentProgram);
+                initProgSent = true;
+                VisionTM.Restart();
+                return FCResultType.IDLE;
+            }
+
+            // Dar tiempo a que la camara termine de cargar el programa antes del primer trigger
+            if (!VisionTM.IsOn(3000))
+                return FCResultType.IDLE;
+
+            initProgSent = false;
             return FCResultType.NEXT;
         }
         private FCResultType fcInitCamConnectLight_FlowRun(object sender, EventArgs e)
@@ -686,10 +748,8 @@ namespace Acura3._1.ModuleForms
 
         private FCResultType fcAutoCamTrigger_FlowRun(object sender, EventArgs e)
         {
-            if (VisionTM.IsOn(delayTrigger))
+            if (TriggerCam(VisionTM))
             {
-                XGX.TriggerFinish[1] = false;
-                XGX.Trigger(1);
                 VisionTM.Restart();
                 return FCResultType.NEXT;
             }
@@ -705,10 +765,10 @@ namespace Acura3._1.ModuleForms
 
         private FCResultType fcCamDelay_FlowRun(object sender, EventArgs e)
         {
-            if (XGX.TriggerFinish[1])
+            // Esperar el resultado real, no solo el eco "T1"
+            if (XGX.ResultReady[1])
             {
                 ShowVisionImage();
-                XGX.TriggerFinish[1] = false;
                 return FCResultType.NEXT;
             }
 
@@ -716,6 +776,8 @@ namespace Acura3._1.ModuleForms
             {
                 if (retryCount == 0)
                 {
+                    MiddleLayer.LogF.AddLog(FunctionForms.LogForm.LogType.Production,
+                        $"Vision:Timeout,Process:{CurrentProcess};Cavity:{currentCavity.Cavity}");
                     SysPara.Status[(int)Step.Inspection] = false;
                     SysPara.hsCam.Complete = true;
                     return FCResultType.PREVIOUS;
@@ -752,8 +814,21 @@ namespace Acura3._1.ModuleForms
 
             if (currentCavity.Alignment)
             {
-                double X = double.TryParse(XGX.Result[1][2], out double x) ? x : 0.0;
-                double Y = double.TryParse(XGX.Result[1][3], out double y) ? y : 0.0;
+                // Sin X,Y validos no se aprieta con offset 0: se trata como NG
+                if (!GetAlignment(out double X, out double Y) && !SysPara.IsDryRun)
+                {
+                    if (retryCount == 0)
+                    {
+                        SysPara.Status[(int)Step.Inspection] = false;
+                        SysPara.hsCam.Complete = true;
+                        MasterCore.Alarm.Show("9020", "Vision alignment data invalid");
+                        return FCResultType.PREVIOUS;
+                    }
+
+                    VisionTM.Restart();
+                    return FCResultType.CASE1;
+                }
+
                 if (!Alignment.ContainsKey(currentCavity.Cavity))
                     Alignment.Add(currentCavity.Cavity, (X, Y, true));
                 else
@@ -870,10 +945,8 @@ namespace Acura3._1.ModuleForms
 
         private FCResultType fcAutoRetryTrigger_FlowRun(object sender, EventArgs e)
         {
-            if (RetryTM.IsOn(delayTrigger))
+            if (TriggerCam(RetryTM))
             {
-                XGX.TriggerFinish[1] = false;
-                XGX.Trigger(1);
                 RetryTM.Restart();
                 return FCResultType.NEXT;
             }
@@ -882,9 +955,8 @@ namespace Acura3._1.ModuleForms
 
         private FCResultType fcAutoRetryWaitData_FlowRun(object sender, EventArgs e)
         {
-            if (XGX.TriggerFinish[1])
+            if (XGX.ResultReady[1])
             {
-                XGX.TriggerFinish[1] = false;
                 return FCResultType.NEXT;
             }
 
@@ -926,8 +998,19 @@ namespace Acura3._1.ModuleForms
                              cavities.Any(c => c.Cavity == RetryProcess.Cavity && c.Alignment);
             if (alignment)
             {
-                double X = double.TryParse(XGX.Result[1][2], out double x) ? x : 0.0;
-                double Y = double.TryParse(XGX.Result[1][3], out double y) ? y : 0.0;
+                if (!GetAlignment(out double X, out double Y))
+                {
+                    if (retryCount == 0)
+                    {
+                        SysPara.Status[(int)Step.Inspection] = false;
+                        SysPara.hsRetry.Complete = true;
+                        return FCResultType.PREVIOUS;
+                    }
+
+                    RetryTM.Restart();
+                    return FCResultType.CASE1;
+                }
+
                 if (!Alignment.ContainsKey(RetryProcess.Cavity))
                     Alignment.Add(RetryProcess.Cavity, (X, Y, true));
                 else
@@ -994,7 +1077,7 @@ namespace Acura3._1.ModuleForms
                 tool = currentCavity.ReInspect ? tool + 1 : tool;
                 XGX.WriteVariables(new (string, double)[] { ("#Branch", tool) });
                 XGX.Trigger(1);
-                VisionTM.Restart();
+                RetryTM.Restart();
                 return FCResultType.NEXT;
             }
             return FCResultType.IDLE;
@@ -1054,10 +1137,8 @@ namespace Acura3._1.ModuleForms
 
         private FCResultType fcAutoManualTrigger_FlowRun(object sender, EventArgs e)
         {
-            if (ManualTM.IsOn(delayTrigger))
+            if (TriggerCam(ManualTM))
             {
-                XGX.TriggerFinish[1] = false;
-                XGX.Trigger(1);
                 ManualTM.Restart();
                 return FCResultType.NEXT;
             }
@@ -1066,16 +1147,14 @@ namespace Acura3._1.ModuleForms
 
         private FCResultType fcAutoManualWaitData_FlowRun(object sender, EventArgs e)
         {
-            if(XGX.TriggerFinish[1])
+            if(XGX.ResultReady[1])
             {
                 ShowVisionImage();
-                XGX.TriggerFinish[1] = false;
                 return FCResultType.NEXT;
             }
 
             if (ManualTM.IsOn(3000))
             {
-                XGX.TriggerFinish[1] = false;
                 MasterCore.Alarm.Show("9003", "Vision Trigger Timeout");
                 ManualTM.Restart();
                 return FCResultType.PREVIOUS;
